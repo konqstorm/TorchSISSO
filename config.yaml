@@ -1,0 +1,37 @@
+# =========================
+# SISSO configuration
+# =========================
+
+data:
+  path: "train.dat"
+  target: "Eads"
+  test_size: 0.2
+  seed: 42
+
+cv:
+  folds: 5
+  fold_timeout_sec: 300
+
+run_mode:
+  fast: false   # true | false
+
+model_configs:
+
+  fast:
+    operators: ["+", "-", "*", "/", "pow(2)", "abs"]
+    n_expansion: 2
+    k_subspace: 8
+    n_terms: [1, 2]
+    use_gpu: false
+
+  full:
+    operators: ["+", "-", "*", "/", "pow(2)", "abs"]
+    n_expansion: 3
+    k_subspace: 10
+    n_terms: [1, 2, 3]
+    use_gpu: false
+
+output:
+  save_predictions: true
+  save_plots: false
+  out_dir: "results"

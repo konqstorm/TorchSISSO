@@ -5,13 +5,13 @@ Importing the required libraries
 
 ##############################################################################################
 '''
+from itertools import combinations as py_combinations
 import torch
 import pandas as pd
 import numpy as np
 import warnings
 import itertools
 import time
-from itertools import combinations
 from . import combinations_construction
 from . import unary_construction
 
@@ -108,6 +108,8 @@ class feature_space_construction:
         self.custom_unary_functions = custom_unary_functions
 
         self.custom_binary_functions = custom_binary_functions
+
+        self.combination_cache = {}
 
     '''
   ###############################################################################################################
@@ -369,138 +371,169 @@ class feature_space_construction:
   '''
 
     def combinations(self, operators_set, i):
+        # 1. Строгое кеширование с неизменяемым ключом
+        # Превращаем set в отсортированный tuple для уникальности ключа
+        op_key = tuple(sorted(list(operators_set)))
 
-        if len(operators_set) == 0 and self.custom_binary_functions != None:
+        # Быстрая проверка наличия в кеше
+        if op_key in self.combination_cache:
+            if i in self.combination_cache[op_key]:
+                cached_val = self.combination_cache[op_key][i]
+                if cached_val is not None:
+                    # Возвращаем копии, чтобы не испортить кеш извне
+                    return cached_val[0].clone(), cached_val[1][:]
+        else:
+            self.combination_cache[op_key] = {}
 
-            self.feature_values11 = torch.empty(
-                self.df.shape[0], 0).to(self.device)
-            feature_names_11 = []
+        # Используем no_grad, так как здесь не нужны градиенты (экономит память и время)
+        with torch.no_grad():
+            new_features_list = []
+            new_names_list = []
 
-            constructor = combinations_construction.FeatureConstructor(
-                self.df_feature_values, self.columns)
-
-            results, expressions = constructor.construct_generic_features(
-                self.custom_binary_functions)
-            self.feature_values11 = torch.cat(
-                (self.feature_values11, results), dim=1)
-            feature_names_11.extend(expressions)
-            self.feature_values_binary = torch.cat(
-                (self.feature_values_binary, self.feature_values11), dim=1)
-            self.feature_names_binary.extend(feature_names_11)
-            del self.feature_values11, feature_names_11
-
-        for op in operators_set:
-            s = time.time()
-            # getting list of cobinations without replacement using itertools
-            combinations1 = list(combinations(self.columns, 2))
-
-            combinations2 = torch.combinations(
-                torch.arange(self.df_feature_values.shape[1]), 2)
-
-            comb_tensor = self.df_feature_values.T[combinations2, :]
-
-            # Reshaping to match
-            x_p = comb_tensor.permute(0, 2, 1)
-
-            del comb_tensor, combinations2  # Deleting to release the memory
-            self.feature_values11 = torch.empty(
-                self.df.shape[0], 0).to(self.device)
-            feature_names_11 = []
-
-            # Performs the addition transformation of feature space with the combinations generated
-            if op == '+':
-                sum = torch.sum(x_p, dim=2).T
-                self.feature_values11 = torch.cat(
-                    (self.feature_values11, sum), dim=1)
-                feature_names_11.extend(
-                    list(map(lambda comb: '('+'+'.join(comb)+')', combinations1)))
-
-            # Performs the subtraction transformation of feature space with the combinations generated
-            elif op == '-':
-                sub = torch.sub(x_p[:, :, 0], x_p[:, :, 1]).T
-                self.feature_values11 = torch.cat(
-                    (self.feature_values11, sub), dim=1)
-                feature_names_11.extend(
-                    list(map(lambda comb: '('+'-'.join(comb)+')', combinations1)))
-
-            # Performs the division transformation of feature space with the combinations generated
-            elif op == '/':
-                div1 = torch.div(x_p[:, :, 0], x_p[:, :, 1]).T
-                div2 = torch.div(x_p[:, :, 1], x_p[:, :, 0]).T
-                self.feature_values11 = torch.cat(
-                    (self.feature_values11, div1, div2), dim=1)
-                feature_names_11.extend(
-                    list(map(lambda comb: '('+'/'.join(comb)+')', combinations1)))
-                feature_names_11.extend(
-                    list(map(lambda comb: '('+'/'.join(comb[::-1])+')', combinations1)))
-
-            # Performs the multiplication transformation of feature space with the combinations generated
-            elif op == '*':
-                mul = torch.multiply(x_p[:, :, 0], x_p[:, :, 1]).T
-                self.feature_values11 = torch.cat(
-                    (self.feature_values11, mul), dim=1)
-                feature_names_11.extend(
-                    list(map(lambda comb: '('+'*'.join(comb)+')', combinations1)))
-
-            elif self.custom_binary_functions != None:
-
+            # --- Блок Custom Binary Functions ---
+            if len(operators_set) == 0 and self.custom_binary_functions is not None:
                 constructor = combinations_construction.FeatureConstructor(
                     self.df_feature_values, self.columns)
-
                 results, expressions = constructor.construct_generic_features(
                     self.custom_binary_functions)
-                self.feature_values11 = torch.cat(
-                    (self.feature_values11, results), dim=1)
-                feature_names_11.extend(expressions)
 
-            self.feature_values_binary = torch.cat(
-                (self.feature_values_binary, self.feature_values11), dim=1)
-            self.feature_names_binary.extend(feature_names_11)
-            del self.feature_values11, feature_names_11
-            # print('Operator::',op,time.time()-s)
+                new_features_list.append(results)
+                new_names_list.extend(expressions)
 
-        # Checking whether the lists are empty
-        if len(self.feature_names_binary) == 0:
+            # --- Блок Стандартных Операторов ---
+            elif len(operators_set) > 0:
+                # Предварительная подготовка индексов и данных
+                # Получаем индексы всех пар (N_pairs, 2)
+                # Важно: используем device для индексов, чтобы индексация шла на GPU
+                num_features = self.df_feature_values.shape[1]
+                comb_indices = torch.combinations(
+                    torch.arange(num_features, device=self.device), 2)
+
+                # Извлекаем левые и правые операнды сразу в формате (Samples, Pairs)
+                # Это исключает необходимость в permute и transpose (.T) в дальнейшем
+                left_ops = self.df_feature_values[:, comb_indices[:, 0]]
+                right_ops = self.df_feature_values[:, comb_indices[:, 1]]
+
+                # Предварительная генерация списка пар имен (CPU операция)
+                # Делаем это один раз, а не внутри цикла по операторам
+                col_pairs = list(py_combinations(self.columns, 2))
+
+                for op in operators_set:
+                    if op == '+':
+                        # Операция сразу над всеми парами: (Samples, Pairs) + (Samples, Pairs)
+                        res = left_ops + right_ops
+                        new_features_list.append(res)
+                        # Быстрая генерация имен без lambda
+                        new_names_list.extend(
+                            [f"({c1}+{c2})" for c1, c2 in col_pairs])
+
+                    elif op == '-':
+                        res = left_ops - right_ops
+                        new_features_list.append(res)
+                        new_names_list.extend(
+                            [f"({c1}-{c2})" for c1, c2 in col_pairs])
+
+                    elif op == '*':
+                        res = left_ops * right_ops
+                        new_features_list.append(res)
+                        new_names_list.extend(
+                            [f"({c1}*{c2})" for c1, c2 in col_pairs])
+
+                    elif op == '/':
+                        # Деление генерирует в 2 раза больше признаков (A/B и B/A)
+                        div1 = left_ops / right_ops
+                        div2 = right_ops / left_ops
+                        new_features_list.append(div1)
+                        new_features_list.append(div2)
+                        new_names_list.extend(
+                            [f"({c1}/{c2})" for c1, c2 in col_pairs])
+                        new_names_list.extend(
+                            [f"({c2}/{c1})" for c1, c2 in col_pairs])
+
+                # Если есть кастомные функции вместе с операторами (редкий кейс, но поддержим)
+                if self.custom_binary_functions is not None:
+                    constructor = combinations_construction.FeatureConstructor(
+                        self.df_feature_values, self.columns)
+                    results, expressions = constructor.construct_generic_features(
+                        self.custom_binary_functions)
+                    new_features_list.append(results)
+                    new_names_list.extend(expressions)
+
+            # --- Сборка и Очистка ---
+
+            # Если ничего не сгенерировали (пустой список)
+            if not new_features_list:
+                # Возвращаем текущее состояние (возможно, пустое)
+                self.combination_cache[op_key][i] = (
+                    self.feature_values_binary, self.feature_names_binary)
+                return self.feature_values_binary, self.feature_names_binary
+
+            # 2. Однократная конкатенация новых признаков
+            new_features_tensor = torch.cat(new_features_list, dim=1)
+
+            # Конкатенация с уже существующими бинарными признаками (накопление)
+            # Обратите внимание: в оригинале self.feature_values_binary накапливается.
+            combined_features = torch.cat(
+                (self.feature_values_binary, new_features_tensor), dim=1)
+            combined_names = self.feature_names_binary + new_names_list
+
+            # 3. Очистка от NaN/Inf (Векторизовано)
+            # Проверяем только combined_features.
+            # Оптимизация: torch.any(dim=0) возвращает маску плохих колонок
+            is_nan = torch.isnan(combined_features).any(dim=0)
+            is_inf = torch.isinf(combined_features).any(dim=0)
+            to_drop_mask = is_nan | is_inf  # Логическое ИЛИ
+
+            if to_drop_mask.any():
+                # Оставляем только "хорошие" колонки (~to_drop_mask)
+                good_indices = (~to_drop_mask).nonzero(as_tuple=True)[0]
+                combined_features = combined_features[:, good_indices]
+                # Фильтруем имена (с помощью itertools.compress было бы быстрее для огромных списков,
+                # но list comprehension здесь понятнее и достаточно быстр)
+                # Нам нужно преобразовать маску тензора в список булевых значений для фильтрации имен
+                keep_mask_list = (~to_drop_mask).tolist()
+                combined_names = [name for name, keep in zip(
+                    combined_names, keep_mask_list) if keep]
+
+            # 4. Удаление дубликатов (Самая тяжелая операция)
+            # Выполняем unique только если это не последняя итерация
+            if self.operators is not None and (i + 1 != self.no_of_operators):
+                # unique с dim=1 очень дорогая операция.
+                # sorted=False может немного ускорить
+                unique_vals, unique_indices = torch.unique(
+                    combined_features, sorted=False, dim=1, return_inverse=True
+                )
+                # unique_indices возвращает индексы оригинального тензора, которые формируют unique вывод
+                # Но torch.unique возвращает сами уникальные значения первым аргументом
+
+                # Нам нужны только уникальные колонки.
+                # torch.unique(dim=1) уже вернул unique_vals - это тензор без дубликатов.
+                # Но нам нужны индексы, чтобы отфильтровать имена.
+
+                # Трюк: чтобы получить индексы ПЕРВЫХ вхождений уникальных элементов (для фильтрации имен):
+                # К сожалению, torch.unique не имеет return_index (как numpy).
+                # Поэтому используем следующий подход:
+                perm = torch.arange(unique_indices.size(
+                    0), dtype=unique_indices.dtype, device=unique_indices.device)
+                unique_indices_of_first_occurence = perm.new_empty(
+                    unique_vals.size(1)).scatter_(0, unique_indices, perm)
+                # Сортируем индексы, чтобы сохранить порядок признаков (опционально, но полезно)
+                unique_indices_of_first_occurence, _ = unique_indices_of_first_occurence.sort()
+
+                combined_features = combined_features[:,
+                                                      unique_indices_of_first_occurence]
+                combined_names = [combined_names[idx]
+                                  for idx in unique_indices_of_first_occurence.tolist()]
+
+            # Обновляем состояние класса
+            self.feature_values_binary = combined_features
+            self.feature_names_binary = combined_names
+
+            # Сохраняем в кеш (клонируем тензор, имена копируем срезом)
+            self.combination_cache[op_key][i] = (
+                self.feature_values_binary.clone(), self.feature_names_binary[:])
+
             return self.feature_values_binary, self.feature_names_binary
-
-        else:
-            # Removing Nan and inf columns from tenosr and corresponding variable name form the list
-
-            nan_columns = torch.any(torch.isnan(
-                self.feature_values_binary), dim=0)
-            inf_columns = torch.any(torch.isinf(
-                self.feature_values_binary), dim=0)
-            nan_or_inf_columns = nan_columns | inf_columns
-
-            # Remove columns from tensor
-            self.feature_values_binary = self.feature_values_binary[:,
-                                                                    ~nan_or_inf_columns]
-
-            # Remove corresponding elements from list
-            self.feature_names_binary = [elem for i, elem in enumerate(
-                self.feature_names_binary) if not nan_or_inf_columns[i]]
-
-            # Get the duplicate columns in the feature space created..
-            if self.operators != None:
-
-                if i+1 != self.no_of_operators:
-
-                    unique_columns, indices = torch.unique(
-                        self.feature_values_binary, sorted=False, dim=1, return_inverse=True)
-
-                    # Get the indices of the unique columns
-                    unique_indices = indices.unique()
-
-                    # Remove duplicate columns
-                    self.feature_values_binary = self.feature_values_binary[:,
-                                                                            unique_indices]
-
-                    # Remove the corresponding elements from the list of feature names..
-                    self.feature_names_binary = [
-                        self.feature_names_binary[i] for i in unique_indices.tolist()]
-
-            # Returning the featurespace created
-            return self.feature_values_binary, self.feature_names_binary  # created_space
 
     '''
   ##########################################################################################################
