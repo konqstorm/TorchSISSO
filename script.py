@@ -13,6 +13,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 from sklearn.model_selection import train_test_split, KFold
+from mpi4py import MPI
 
 from src.TorchSisso import SissoModel
 
@@ -185,14 +186,41 @@ def main():
     mode = "fast" if cfg["run_mode"]["fast"] else "full"
     model_cfg = cfg["model_configs"][mode]
 
-    # CV5 на TRAIN для выбора n_term
-    cv_results = []
-    for n in model_cfg["n_terms"]:
-        scores = cv_rmse_for_nterm(df_train, n, cfg, model_cfg)
-        cv_results.append((n, scores.mean(), scores.std(), scores))
+    # --------------------------------------------------------
+    # MPI: CV по n_terms
+    # --------------------------------------------------------
+    comm = MPI.COMM_WORLD
+    rank = comm.Get_rank()
+    size = comm.Get_size()
 
-    cv_results.sort(key=lambda x: x[1])
-    best_n_term, cv_mean, cv_std, cv_all = cv_results[0]
+    n_terms_all = model_cfg["n_terms"]
+
+    # раздаём n_terms по ранкам
+    n_terms_local = n_terms_all[rank::size]
+
+    local_results = []
+    for n in n_terms_local:
+        scores = cv_rmse_for_nterm(df_train, n, cfg, model_cfg)
+        local_results.append((n, scores.mean(), scores.std(), scores))
+
+    # собираем всё на rank 0
+    gathered = comm.gather(local_results, root=0)
+
+    if rank == 0:
+        cv_results = []
+        for chunk in gathered:
+            cv_results.extend(chunk)
+
+        cv_results.sort(key=lambda x: x[1])
+        best_n_term, cv_mean, cv_std, cv_all = cv_results[0]
+    else:
+        best_n_term = None
+        cv_mean = cv_std = cv_all = None
+
+    # рассылаем лучший n_term всем
+    best_n_term = comm.bcast(best_n_term, root=0)
+    cv_mean = comm.bcast(cv_mean, root=0)
+    cv_std = comm.bcast(cv_std, root=0)
 
     # Full-fit на ВСЕХ данных
     sm_full = make_sisso_model(
@@ -252,7 +280,7 @@ def main():
 
     if cfg["output"]["save_plots"]:
         labels = ["Overall (train full)",
-                  f"CV{cfg["cv"]["folds"]} mean (train)", "Validation (20%)"]
+                  f"CV{cfg['cv']['folds']} mean (train)", "Validation (20%)"]
         values = [overall_rmse, cv_mean, val_rmse]
         plt.figure(figsize=(5, 4))
         plt.bar(labels, values)
